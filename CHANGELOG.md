@@ -3,7 +3,7 @@
 All notable changes to the NG port. 1.3.7 - 1.3.21 have been released;
 1.3.19 was an internal build that was folded into 1.3.20.
 
-## Unreleased
+## 1.3.22
 
 **Fixed: trading with a follower stripped the enchantments off their worn
 armour.** Giving or taking any item in the trade menu, even a potion, removed

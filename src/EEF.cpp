@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
@@ -13,6 +14,8 @@
 #include "REL/Offset2ID.h"
 #include "REL/Relocation.h"
 #include "SKSE/Trampoline.h"
+
+#include <hde64.h>
 
 #include "EEF.h"
 
@@ -24,6 +27,7 @@ namespace EEF
 		bool s_onActorLoad{ true };
 		bool s_recalcWeightOnLoad{ false };
 		bool s_redirectDispel{ true };
+		bool s_scriptEquipEventFix{ false };
 
 		constexpr auto kIniPath = "Data\\SKSE\\Plugins\\EquipEnchantmentFix.ini";
 
@@ -530,6 +534,316 @@ namespace EEF
 			return true;
 		}
 
+		// --- the script-equip fix (optional) --------------------------------
+		// Papyrus `Actor.EquipItem` reaches the engine with no extra data, so the
+		// engine equips a bare instance of the form and the item's OnEquipped
+		// event never fires. Mods that script an equip depend on that event --
+		// Torch Mechanics Fixed names this exact option as a requirement, the
+		// Aetherial Crown scripted-equip fix exists only because of it, and
+		// follower outfit scripts are the same shape. The original plugin's
+		// ScriptEquipEventFix (off by default there too) answers it by putting
+		// the inventory instance's own extra data back onto the call; this is
+		// that same fix.
+		//
+		// It is an ENTRY hook, and the only patch in this plugin that copies
+		// bytes, so it is also the only one that can corrupt code: the copied
+		// prologue has to end on an instruction boundary and must not carry an
+		// operand that only means anything at its original address. The prologue
+		// is decoded before anything is written, and every unexpected answer
+		// refuses the hook and leaves the engine exactly as it was.
+		using EquipObject_t = void (*)(
+			RE::ActorEquipManager*,  // this
+			RE::Actor*,
+			RE::TESBoundObject*,
+			RE::ExtraDataList*,
+			std::uint32_t,
+			const RE::BGSEquipSlot*,
+			bool,
+			bool,
+			bool,
+			bool);
+
+		EquipObject_t EquipObject_orig{ nullptr };
+
+		struct EquipItemLookup
+		{
+			RE::ExtraDataList* extraData;
+			bool               matched;
+			bool               worn;
+		};
+
+		// The engine's own visitor, ported: the first inventory entry of the
+		// matching form, its first extra list as the instance, and "already
+		// worn" if any of that entry's extra lists carries the worn flag.
+		void FindEquipItemExtraData(RE::Actor* a_actor, RE::TESBoundObject* a_form, EquipItemLookup* a_out)
+		{
+			auto* changes = a_actor->GetInventoryChanges(true);
+			if (!changes || !changes->entryList) {
+				return;
+			}
+
+			for (auto* entry : *changes->entryList) {
+				if (!entry || entry->object != a_form) {
+					continue;
+				}
+
+				a_out->matched = true;
+
+				if (!entry->extraLists) {
+					return;
+				}
+
+				bool first = true;
+				for (auto* xList : *entry->extraLists) {
+					if (first) {
+						a_out->extraData = xList;
+						first = false;
+					}
+					if (xList && (xList->HasType<RE::ExtraWorn>() || xList->HasType<RE::ExtraWornLeft>())) {
+						a_out->worn = true;
+						break;
+					}
+				}
+				return;
+			}
+		}
+
+		// Split out so the walk can sit under __try, which MSVC refuses beside
+		// objects with destructors.
+		[[nodiscard]] bool TryFindEquipItemExtraData(RE::Actor* a_actor, RE::TESBoundObject* a_form, EquipItemLookup* a_out)
+		{
+			__try {
+				FindEquipItemExtraData(a_actor, a_form, a_out);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		void EquipObject_Hook(
+			RE::ActorEquipManager*  a_this,
+			RE::Actor*              a_actor,
+			RE::TESBoundObject*     a_object,
+			RE::ExtraDataList*      a_extraData,
+			std::uint32_t           a_count,
+			const RE::BGSEquipSlot* a_slot,
+			bool                    a_queueEquip,
+			bool                    a_forceEquip,
+			bool                    a_playSounds,
+			bool                    a_applyNow)
+		{
+			// Everything below is additive: unless a form is being equipped with
+			// no extra data and the inventory holds an instance of it that is not
+			// the one already worn, the arguments go through untouched.
+			if (!a_extraData && a_actor && a_object && a_count > 0) {
+				auto* process = a_actor->GetActorRuntimeData().currentProcess;
+				if (process && a_object != process->equippedObjects[0] && a_object != process->equippedObjects[1]) {
+					EquipItemLookup found{};
+					if (TryFindEquipItemExtraData(a_actor, a_object, &found)) {
+						if (found.matched && !found.worn) {
+							SKSE::log::debug("script-equip fix: equipping {:08X} on actor {:08X} with its inventory instance's extra data ({})",
+								a_object->GetFormID(), a_actor->GetFormID(), found.extraData ? "present" : "none");
+							a_extraData = found.extraData;
+						}
+					} else {
+						SKSE::log::error("script-equip lookup faulted for {:08X} on actor {:08X}; equipping unchanged",
+							a_object->GetFormID(), a_actor->GetFormID());
+					}
+				}
+			}
+
+			EquipObject_orig(
+				a_this,
+				a_actor,
+				a_object,
+				a_extraData,
+				a_count,
+				a_slot,
+				a_queueEquip,
+				a_forceEquip,
+				a_playSounds,
+				a_applyNow);
+		}
+
+		// The branch goes in at the first instruction boundary at or past this
+		// offset, never at the entry itself: this function's prologue branches
+		// inside its first few bytes, and a copied relative branch would jump
+		// into nowhere. The offset is the original plugin's own site, past the
+		// prologue, and the walk below is what makes landing there safe rather
+		// than assumed.
+		constexpr std::size_t kPatchOffset = 0x9;
+		constexpr std::size_t kPatchSize = 6;
+
+		struct EntryPatchPlan
+		{
+			std::uintptr_t site;
+			std::size_t    copySize;
+		};
+
+		// A relative branch keeps its displacement in the immediate field, and
+		// the width follows the operand size.
+		[[nodiscard]] std::int64_t RelativeDisplacement(const hde64s& a_hs)
+		{
+			if ((a_hs.flags & F_IMM8) != 0) {
+				return static_cast<std::int8_t>(a_hs.imm.imm8);
+			}
+			if ((a_hs.flags & F_IMM16) != 0) {
+				return static_cast<std::int16_t>(a_hs.imm.imm16);
+			}
+			if ((a_hs.flags & F_IMM32) != 0) {
+				return static_cast<std::int32_t>(a_hs.imm.imm32);
+			}
+			return 0;
+		}
+
+		// Where the branch goes, and how many whole instructions have to move
+		// with it. Refuses anything that would not survive being copied: an
+		// operand measured from its own address, or a branch that would land in
+		// the bytes being replaced.
+		[[nodiscard]] bool PlanEntryPatch(std::uintptr_t a_entry, EntryPatchPlan* a_out)
+		{
+			// The bytes before the site keep running where they are, but a
+			// branch among them must not land inside what the branch replaces.
+			std::vector<std::uintptr_t> earlyTargets;
+			std::size_t                 at = 0;
+			while (at < kPatchOffset) {
+				hde64s     hs{};
+				const auto len = hde64_disasm(reinterpret_cast<const void*>(a_entry + at), &hs);
+				if (len == 0 || (hs.flags & F_ERROR) != 0) {
+					SKSE::log::error("script-equip fix: undecodable instruction at {:X} (+{:#x}); not hooking", a_entry + at, at);
+					return false;
+				}
+				if ((hs.flags & F_RELATIVE) != 0) {
+					earlyTargets.push_back(a_entry + at + len + static_cast<std::uintptr_t>(RelativeDisplacement(hs)));
+				}
+				at += len;
+			}
+
+			// The walk stopped on a boundary, so the site is one by
+			// construction -- which is the whole point of not using the entry.
+			a_out->site = a_entry + at;
+
+			std::size_t copied = 0;
+			while (copied < kPatchSize) {
+				hde64s     hs{};
+				const auto len = hde64_disasm(reinterpret_cast<const void*>(a_out->site + copied), &hs);
+				if (len == 0 || (hs.flags & F_ERROR) != 0) {
+					SKSE::log::error("script-equip fix: undecodable instruction at {:X} (+{:#x}); not hooking", a_out->site + copied, copied);
+					return false;
+				}
+				if ((hs.flags & F_RELATIVE) != 0) {
+					SKSE::log::error("script-equip fix: relative branch at {:X} (+{:#x}); not hooking", a_out->site + copied, copied);
+					return false;
+				}
+				if ((hs.flags & F_MODRM) != 0 && hs.modrm_mod == 0 && hs.modrm_rm == 5) {
+					SKSE::log::error("script-equip fix: rip-relative operand at {:X} (+{:#x}); not hooking", a_out->site + copied, copied);
+					return false;
+				}
+				copied += len;
+			}
+			a_out->copySize = copied;
+
+			const auto end = a_out->site + copied;
+			for (const auto target : earlyTargets) {
+				if (target >= a_out->site && target < end) {
+					SKSE::log::error("script-equip fix: a branch before the site lands inside the copied bytes; not hooking");
+					return false;
+				}
+			}
+
+			return true;
+		}
+
+		// An entry patch is a six-byte `jmp [rip + disp32]` through a slot in the
+		// trampoline, never a five-byte rel32 branch: the slot is allocated
+		// within reach of the module by construction, where a direct branch to
+		// this DLL is not guaranteed to be.
+		[[nodiscard]] bool InstallScriptEquipFix()
+		{
+			static REL::Relocation<std::uintptr_t> entry{ REL::RelocationID(37938, 38894) };
+			const auto                             addr = entry.address();
+
+			const auto* bytes = reinterpret_cast<const std::uint8_t*>(addr);
+			if (bytes[0] == 0xE9 || bytes[0] == 0xEB || bytes[0] == 0xCC ||
+				(bytes[0] == 0xFF && bytes[1] == 0x25)) {
+				SKSE::log::error("script-equip fix: the entry at {:X} is already patched or is a thunk ({:02X} {:02X}); not hooking",
+					addr, bytes[0], bytes[1]);
+				return false;
+			}
+
+			EntryPatchPlan plan{};
+			if (!PlanEntryPatch(addr, &plan)) {
+				return false;
+			}
+
+			const auto* site = reinterpret_cast<const std::uint8_t*>(plan.site);
+			if (site[0] == 0xE9 || site[0] == 0xEB || site[0] == 0xCC ||
+				(site[0] == 0xFF && site[1] == 0x25)) {
+				SKSE::log::error("script-equip fix: the site at {:X} is already patched or is a thunk ({:02X} {:02X}); not hooking",
+					plan.site, site[0], site[1]);
+				return false;
+			}
+
+			constexpr std::size_t kJmpBackSize = 14;  // FF 25 00000000 + qword target
+			auto&                 trampoline = SKSE::GetTrampoline();
+			if (trampoline.free_size() < plan.copySize + kJmpBackSize + sizeof(std::uintptr_t)) {
+				SKSE::log::error("script-equip fix: no room in the trampoline; not hooking");
+				return false;
+			}
+
+			try {
+				// The copy runs the instructions the branch overwrites, then
+				// rejoins the function just past them.
+				auto* copy = static_cast<std::uint8_t*>(trampoline.allocate(plan.copySize + kJmpBackSize));
+				std::memcpy(copy, reinterpret_cast<const void*>(plan.site), plan.copySize);
+				auto* jmp = copy + plan.copySize;
+				jmp[0] = 0xFF;
+				jmp[1] = 0x25;
+				jmp[2] = 0;
+				jmp[3] = 0;
+				jmp[4] = 0;
+				jmp[5] = 0;
+				const auto resume = plan.site + plan.copySize;
+				std::memcpy(jmp + 6, &resume, sizeof(resume));
+
+				auto*      slot = trampoline.allocate<std::uintptr_t>();
+				const auto target = reinterpret_cast<std::uintptr_t>(&EquipObject_Hook);
+				std::memcpy(slot, &target, sizeof(target));
+
+				const auto disp = reinterpret_cast<const std::uint8_t*>(slot) - reinterpret_cast<const std::uint8_t*>(plan.site + kPatchSize);
+				if (disp < (std::numeric_limits<std::int32_t>::min)() || disp > (std::numeric_limits<std::int32_t>::max)()) {
+					SKSE::log::error("script-equip fix: the trampoline slot is out of range of the site; not hooking");
+					return false;
+				}
+
+				std::uint8_t patch[kPatchSize];
+				patch[0] = 0xFF;
+				patch[1] = 0x25;
+				const auto disp32 = static_cast<std::int32_t>(disp);
+				std::memcpy(patch + 2, &disp32, sizeof(disp32));
+
+				// Last gate: the bytes about to be overwritten must still be the
+				// ones just decoded and copied, or something else patched this
+				// site between the read and the write.
+				if (!REL::safe_write(plan.site, patch, kPatchSize, copy, kPatchSize)) {
+					SKSE::log::error("script-equip fix: the site at {:X} changed under us; not hooking", plan.site);
+					return false;
+				}
+
+				EquipObject_orig = reinterpret_cast<EquipObject_t>(copy);
+			} catch (const std::exception& e) {
+				SKSE::log::error("script-equip fix: hook failed: {}", e.what());
+				return false;
+			} catch (...) {
+				SKSE::log::error("script-equip fix: hook failed (unknown exception)");
+				return false;
+			}
+
+			SKSE::log::info("script-equip fix: branch installed at {:X} (entry +{:#x}, {} byte(s) copied)",
+				plan.site, plan.site - addr, plan.copySize);
+			return true;
+		}
+
 		// a_onlyForm: when the caller knows which item was just equipped
 		// (TESEquipEvent::baseObject) only that item is considered. Walking the
 		// whole inventory on every equip is what made switching weapons and
@@ -724,6 +1038,7 @@ namespace EEF
 			s_onActorLoad = ini.GetBoolValue("EEF", "OnActorLoad", true);
 			s_recalcWeightOnLoad = ini.GetBoolValue("EEF", "RecalcPlayerInventoryWeightOnLoad", false);
 			s_redirectDispel = ini.GetBoolValue("EEF", "RedirectDispelWornItemEnchantsVisitor", true);
+			s_scriptEquipEventFix = ini.GetBoolValue("EEF", "ScriptEquipEventFix", false);
 
 			// "debug" shows every step of the redirect and the re-check.
 			if (const auto* level = ini.GetValue("EEF", "LogLevel", nullptr)) {
@@ -732,11 +1047,12 @@ namespace EEF
 			}
 
 			SKSE::log::info(
-				"settings: OnEquip={} OnActorLoad={} RecalcWeight={} RedirectDispel={}",
+				"settings: OnEquip={} OnActorLoad={} RecalcWeight={} RedirectDispel={} ScriptEquipEventFix={}",
 				s_onEquip,
 				s_onActorLoad,
 				s_recalcWeightOnLoad,
-				s_redirectDispel);
+				s_redirectDispel,
+				s_scriptEquipEventFix);
 		}
 	}
 
@@ -857,11 +1173,18 @@ namespace EEF
 			}
 		}
 
+		if (s_scriptEquipEventFix) {
+			if (!InstallScriptEquipFix()) {
+				SKSE::log::warn("script-equip fix unavailable; a scripted equip will not raise OnEquipped for the item");
+			}
+		}
+
 		SKSE::log::info(
-			"registered sinks (OnEquip={} OnActorLoad={} RedirectDispel={})",
+			"registered sinks (OnEquip={} OnActorLoad={} RedirectDispel={} ScriptEquipEventFix={})",
 			s_onEquip,
 			s_onActorLoad,
-			s_redirectDispel);
+			s_redirectDispel,
+			s_scriptEquipEventFix);
 
 		return true;
 	}

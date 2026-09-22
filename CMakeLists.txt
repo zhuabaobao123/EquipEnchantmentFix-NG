@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 3.21)
 
 project(
 	EquipEnchantmentFix
-	LANGUAGES CXX
-	VERSION 1.3.22
+	LANGUAGES C CXX
+	VERSION 1.3.23
 )
 
 set(CMAKE_CXX_STANDARD 23)
@@ -33,6 +33,20 @@ target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_23)
 target_compile_definitions(${PROJECT_NAME} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_precompile_headers(${PROJECT_NAME} PRIVATE include/PCH.h)
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# Vendored instruction-length decoder (MinHook's hde64, BSD-2-Clause -- see
+# third_party/hde64/LICENSE.txt). An entry hook has to know where the copied
+# prologue's instruction boundary is and must refuse a prologue that carries a
+# relative operand; CommonLibSSE links its own copy but keeps the include path
+# PRIVATE, so this carries one.
+target_sources(${PROJECT_NAME} PRIVATE third_party/hde64/hde64.c)
+target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/hde64)
+set_source_files_properties(
+	third_party/hde64/hde64.c PROPERTIES
+	LANGUAGE C
+	SKIP_PRECOMPILE_HEADERS ON
+	COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:MSVC>:/WX->"
+)
 
 # Source/execution charset: the workspace path is non-ASCII (Chinese) and MSVC
 # reads sources with the system code page by default, tripping C4828 on the

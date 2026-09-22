@@ -1,7 +1,20 @@
 # Changelog
 
-All notable changes to the NG port. 1.3.7 - 1.3.21 have been released;
+All notable changes to the NG port. 1.3.7 - 1.3.22 have been released;
 1.3.19 was an internal build that was folded into 1.3.20.
+
+## 1.3.23
+
+**Added: `ScriptEquipEventFix` (off by default), for mods that equip by script.**
+Papyrus `Actor.EquipItem` reaches the engine with no extra data, so the engine
+equips a bare instance and the item's `OnEquipped` never fires. With this on, the
+inventory instance's own extra data is put back onto that call. Torch Mechanics
+Fixed names the option as a requirement.
+
+- Off by default, as in the original. Nothing changes unless you turn it on.
+- The one patch here that copies engine bytes: the bytes are decoded first and the
+  branch goes in at an instruction boundary past the prologue, never at the entry.
+  Anything it cannot prove refuses the hook and leaves the engine untouched.
 
 ## 1.3.22
 

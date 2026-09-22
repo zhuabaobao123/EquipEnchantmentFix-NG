@@ -40,6 +40,7 @@ Use an ASCII-only path for the project checkout: MSVC misreads a non-ASCII PCH p
 OnEquip=true
 OnActorLoad=true
 RedirectDispelWornItemEnchantsVisitor=true
+ScriptEquipEventFix=false
 RecalcPlayerInventoryWeightOnLoad=false
 ; info by default; debug logs every step of the redirect and the re-check
 LogLevel=info
@@ -52,6 +53,8 @@ The original plugin (1.3.5) installed raw code hooks to stop a duplicate enchant
 The call sites are found at launch, not carried as offsets: given the caller's and the callee's Address Library ids, the site is the one `call` inside the caller that lands on the callee. A caller with no such call, or two, is refused and logged.
 
 The ability check itself is the exact test the original used: walk the actor's active effects and match the `(source, spell)` pair, where `source` is the item and `spell` is its enchantment.
+
+`ScriptEquipEventFix` (off by default) answers the other half of the original's bug list: Papyrus `Actor.EquipItem` reaches the engine with no extra data, so the engine equips a bare instance of the form and the item's `OnEquipped` event never fires. Mods that equip by script depend on that event - Torch Mechanics Fixed names this option as a requirement - so with it on, the inventory instance's own extra data is put back onto the call. It is the one patch here that copies engine bytes, so it is the one that can corrupt code: the bytes are decoded first and the branch goes in at an instruction boundary past the prologue, never at the function entry. A prologue carrying a relative operand, an already-patched entry, or anything else it cannot prove refuses the hook and leaves the engine untouched.
 
 ## Credits
 

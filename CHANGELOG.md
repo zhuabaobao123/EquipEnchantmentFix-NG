@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the NG port. 1.3.7 - 1.3.22 have been released;
+All notable changes to the NG port. 1.3.7 - 1.3.23 have been released;
 1.3.19 was an internal build that was folded into 1.3.20.
 
 ## 1.3.23
